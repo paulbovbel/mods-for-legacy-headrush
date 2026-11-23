@@ -4,6 +4,8 @@
  * in-memory buffers for the stock/output image (the caller owns file I/O
  * and, for the GUI, the download); a real temp directory is still needed
  * internally for the rootfs ext4 image (libext2fs needs a real file).
+ * nam_patch_plan() instead uses a file reader and returns write operations
+ * without touching FIT/ext4 images or writing anything to disk.
  */
 #ifndef NAM_GUI_PATCH_PIPELINE_H
 #define NAM_GUI_PATCH_PIPELINE_H
@@ -36,6 +38,36 @@ typedef struct
   int page_up_note;
   bool reverb_pedal;   /* with nam_pedals: also add "Reverb" / "Reverb 2" (Dattorro plate reverb), see docs/REVERB_PEDAL.md */
 } NamPatchOptions;
+
+/* Read-only patch planning. The reader returns a malloc'd buffer owned by the
+ * planner, or false with an error. Only the files requested by the patcher need
+ * to be supplied (Evil and its launcher); no FIT/ext4 image is required.
+ * The caller must validate the source firmware and select a model explicitly.
+ * The page-turner is not supported by this API yet. */
+typedef bool (*NamReadFileFn)(const char* path, void* user_data, uint8_t** data, size_t* len,
+                              char* err, size_t err_size);
+
+typedef struct
+{
+  const char* path; /* static absolute device path */
+  uint8_t* data;
+  size_t len;
+  unsigned mode; /* full regular-file mode, e.g. 0100755 */
+} NamFileWrite;
+
+#define NAM_FILE_PLAN_MAX_WRITES 10
+typedef struct
+{
+  NamFileWrite files[NAM_FILE_PLAN_MAX_WRITES];
+  size_t count;
+} NamFilePlan;
+
+/* Output must not hold a live plan. On failure it is empty; on success release
+ * its owned buffers with nam_file_plan_free(). No filesystem writes occur. */
+bool nam_patch_plan(NamReadFileFn read_file, void* read_user_data, const char* model_name,
+                    const NamPatchOptions* opts, NamProgressFn progress, void* progress_user_data,
+                    NamFilePlan* out_plan, char* err, size_t err_size);
+void nam_file_plan_free(NamFilePlan* plan);
 
 /* `workdir` must already exist (the caller creates and later removes it,
  * e.g. via mkdtemp) -- used only for the rootfs ext4 image's temp files.

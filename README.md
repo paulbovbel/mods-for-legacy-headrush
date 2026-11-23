@@ -235,6 +235,8 @@ INPUT / OUTPUT still trim on top. **OFF** (the default) leaves the signal as is.
 - [docs/PAGE_PEDAL.md](docs/PAGE_PEDAL.md) — the footswitch page-turner.
 - [docs/BUILDING.md](docs/BUILDING.md) — building `nam-mod-gui` from
   source.
+- [docs/FILE_PLAN.md](docs/FILE_PLAN.md) — read-only file-write plans for
+  external firmware composers, without repacking an image.
 
 ## Disclaimer
 

@@ -92,10 +92,39 @@ static bool write_whole_file(const char* path, const uint8_t* data, size_t len, 
   return ok;
 }
 
-bool nam_patch_pipeline(const uint8_t* stock_img_data, size_t stock_img_len, const char* model_name,
-                         const NamPatchOptions* opts, const char* workdir, NamProgressFn progress,
-                         void* progress_user_data, uint8_t** out_img_data, size_t* out_img_len, char* err,
-                         size_t err_size)
+void nam_file_plan_free(NamFilePlan* plan)
+{
+  for (size_t i = 0; i < plan->count; ++i)
+    free(plan->files[i].data);
+  memset(plan, 0, sizeof(*plan));
+}
+
+/* One sink for both modes: apply to ext4, or collect owned output bytes. */
+static bool write_patch(Ext4Image* img, NamFilePlan* plan, const char* path, const uint8_t* data,
+                        size_t len, unsigned mode, char* err, size_t err_size)
+{
+  if (!plan)
+    return nam_ext4_inject(img, path, data, len, mode, err, err_size);
+  if (plan->count == NAM_FILE_PLAN_MAX_WRITES)
+  {
+    set_err(err, err_size, "too many file writes in NAM plan");
+    return false;
+  }
+  uint8_t* copy = (uint8_t*)malloc(len ? len : 1);
+  if (!copy)
+  {
+    set_err(err, err_size, "out of memory collecting NAM plan");
+    return false;
+  }
+  memcpy(copy, data, len);
+  plan->files[plan->count++] = (NamFileWrite){path, copy, len, 0100000 | mode};
+  return true;
+}
+
+static bool patch_pipeline(const uint8_t* stock_img_data, size_t stock_img_len, const char* model_name,
+                          const NamPatchOptions* opts, const char* workdir, NamProgressFn progress,
+                          void* progress_user_data, uint8_t** out_img_data, size_t* out_img_len, char* err,
+                          size_t err_size, NamReadFileFn read_file, void* read_user_data, NamFilePlan* plan)
 {
   *out_img_data = NULL;
   *out_img_len = 0;
@@ -132,6 +161,24 @@ bool nam_patch_pipeline(const uint8_t* stock_img_data, size_t stock_img_len, con
   Ext4Image* img = NULL;
   Ext4Image* verify_img = NULL;
   bool ok = false;
+  const ModelTarget* target = NULL;
+  const char* reason = NULL;
+
+  if (plan)
+  {
+    if (!read_file || !model_name || enable_page_pedal)
+    {
+      set_err(err, err_size, "file planning requires a reader and explicit model; page-turner is unsupported");
+      goto cleanup;
+    }
+    target = nam_select_target(model_name, NULL, &reason);
+    if (!target)
+    {
+      set_err(err, err_size, "%s", reason);
+      goto cleanup;
+    }
+    goto read_inputs;
+  }
 
   if (!nam_fit_parse(stock_img_data, stock_img_len, &props))
   {
@@ -149,8 +196,7 @@ bool nam_patch_pipeline(const uint8_t* stock_img_data, size_t stock_img_len, con
   report(progress, progress_user_data, "OK  extracted metadata: description=%s compatible=%s", metadata.description,
          metadata.compatible);
 
-  const char* reason;
-  const ModelTarget* target = nam_select_target(model_name, metadata.compatible, &reason);
+  target = nam_select_target(model_name, metadata.compatible, &reason);
   if (!target)
   {
     set_err(err, err_size, "%s", reason);
@@ -189,13 +235,23 @@ bool nam_patch_pipeline(const uint8_t* stock_img_data, size_t stock_img_len, con
   if (!nam_ext4_open(rootfs_path, true, &img, err, err_size))
     goto cleanup;
 
-  size_t evil_len;
-  if (!nam_ext4_dump(img, "/usr/Evil/Evil", &evil_data, &evil_len, err, err_size))
+read_inputs:;
+  size_t evil_len = 0, script_len = 0;
+  if (plan)
+  {
+    if (!read_file("/usr/Evil/Evil", read_user_data, &evil_data, &evil_len, err, err_size)
+        || !read_file("/usr/Evil/Scripts/evil", read_user_data, &script_data_raw, &script_len, err, err_size))
+      goto cleanup;
+  }
+  else if (!nam_ext4_dump(img, "/usr/Evil/Evil", &evil_data, &evil_len, err, err_size)
+           || !nam_ext4_dump(img, "/usr/Evil/Scripts/evil", &script_data_raw, &script_len, err, err_size))
     goto cleanup;
-
-  size_t script_len;
-  if (!nam_ext4_dump(img, "/usr/Evil/Scripts/evil", &script_data_raw, &script_len, err, err_size))
+  if (!evil_data || !evil_len || !script_data_raw || !script_len
+      || memchr(script_data_raw, '\0', script_len))
+  {
+    set_err(err, err_size, "missing/empty Evil or launcher, or launcher contains NUL bytes");
     goto cleanup;
+  }
   script_data = (char*)malloc(script_len + 1);
   if (!script_data)
   {
@@ -348,7 +404,7 @@ bool nam_patch_pipeline(const uint8_t* stock_img_data, size_t stock_img_len, con
            page_down + 1, page_up + 1);
   }
 
-  if (getenv("NAM_DUMP_EVIL")) /* debugging aid: write the patched Evil next to the image (see docs/DEV_LOOP.md) */
+  if (!plan && getenv("NAM_DUMP_EVIL")) /* debugging aid: never write in planning mode */
   {
     FILE* df = fopen(getenv("NAM_DUMP_EVIL"), "wb");
     if (df)
@@ -357,7 +413,7 @@ bool nam_patch_pipeline(const uint8_t* stock_img_data, size_t stock_img_len, con
       fclose(df);
     }
   }
-  if (!nam_ext4_inject(img, "/usr/Evil/Evil", evil_data, evil_len, 0755, err, err_size))
+  if (!write_patch(img, plan, "/usr/Evil/Evil", evil_data, evil_len, 0755, err, err_size))
     goto cleanup;
 
   const uint8_t* hook_so = g_nam_hook_so;
@@ -365,32 +421,38 @@ bool nam_patch_pipeline(const uint8_t* stock_img_data, size_t stock_img_len, con
   const uint8_t* preload_so = g_nam_preload_so;
   size_t preload_so_len = (size_t)g_nam_preload_so_len;
 
-  if (!nam_ext4_inject(img, "/usr/Evil/libnam_hook.so", hook_so, hook_so_len, 0755, err, err_size))
+  if (!write_patch(img, plan, "/usr/Evil/libnam_hook.so", hook_so, hook_so_len, 0755, err, err_size))
     goto cleanup;
-  if (!nam_ext4_inject(img, "/usr/Evil/libnam_preload.so", preload_so, preload_so_len, 0755, err, err_size))
+  if (!write_patch(img, plan, "/usr/Evil/libnam_preload.so", preload_so, preload_so_len, 0755, err, err_size))
     goto cleanup;
-  if (!nam_ext4_inject(img, "/usr/Evil/Scripts/evil", (const uint8_t*)new_script, strlen(new_script), 0755, err,
+  if (!write_patch(img, plan, "/usr/Evil/Scripts/evil", (const uint8_t*)new_script, strlen(new_script), 0755, err,
                         err_size))
     goto cleanup;
   report(progress, progress_user_data,
-         "OK  injected patched Evil, libnam_hook.so, libnam_preload.so, launcher script");
+         "OK  prepared patched Evil, libnam_hook.so, libnam_preload.so, launcher script");
   if (qml_pages)
   {
-    if (!nam_ext4_inject(img, "/usr/Evil/Resources/pedal_ui.qml", g_ui_pedal_qml, (size_t)g_ui_pedal_qml_len, 0644, err,
+    if (!write_patch(img, plan, "/usr/Evil/Resources/pedal_ui.qml", g_ui_pedal_qml, (size_t)g_ui_pedal_qml_len, 0644, err,
                          err_size)
-        || !nam_ext4_inject(img, "/usr/Evil/Resources/nam_ui.qml", g_ui_nam_qml, (size_t)g_ui_nam_qml_len, 0644, err,
+        || !write_patch(img, plan, "/usr/Evil/Resources/nam_ui.qml", g_ui_nam_qml, (size_t)g_ui_nam_qml_len, 0644, err,
                             err_size)
-        || !nam_ext4_inject(img, "/usr/Evil/Resources/nam_fix.qml", g_ui_nam_fix_qml, (size_t)g_ui_nam_fix_qml_len, 0644,
+        || !write_patch(img, plan, "/usr/Evil/Resources/nam_fix.qml", g_ui_nam_fix_qml, (size_t)g_ui_nam_fix_qml_len, 0644,
                             err, err_size)
-        || !nam_ext4_inject(img, "/usr/Evil/Resources/pedal_art.qml", g_ui_pedal_art_qml, (size_t)g_ui_pedal_art_qml_len,
+        || !write_patch(img, plan, "/usr/Evil/Resources/pedal_art.qml", g_ui_pedal_art_qml, (size_t)g_ui_pedal_art_qml_len,
                             0644, err, err_size)
-        || !nam_ext4_inject(img, "/usr/Evil/Resources/rig_block.qml", g_ui_rig_block_qml, (size_t)g_ui_rig_block_qml_len,
+        || !write_patch(img, plan, "/usr/Evil/Resources/rig_block.qml", g_ui_rig_block_qml, (size_t)g_ui_rig_block_qml_len,
                             0644, err, err_size)
         || (reverb_pedal
-            && !nam_ext4_inject(img, "/usr/Evil/Resources/reverb_ui.qml", g_ui_reverb_qml, (size_t)g_ui_reverb_qml_len,
+            && !write_patch(img, plan, "/usr/Evil/Resources/reverb_ui.qml", g_ui_reverb_qml, (size_t)g_ui_reverb_qml_len,
                                 0644, err, err_size)))
       goto cleanup;
-    report(progress, progress_user_data, "OK  injected the detail pages (/usr/Evil/Resources/*_ui.qml)");
+    report(progress, progress_user_data, "OK  prepared the detail pages (/usr/Evil/Resources/*_ui.qml)");
+  }
+
+  if (plan)
+  {
+    ok = true;
+    goto cleanup;
   }
 
   if (!nam_ext4_verify_basic(img, err, err_size))
@@ -485,5 +547,27 @@ cleanup:
   free(out_fit);
   free(verify_rootfs_bin);
   free(verify_evil);
+  if (!ok && plan)
+    nam_file_plan_free(plan);
   return ok;
+}
+
+bool nam_patch_plan(NamReadFileFn read_file, void* read_user_data, const char* model_name,
+                    const NamPatchOptions* opts, NamProgressFn progress, void* progress_user_data,
+                    NamFilePlan* out_plan, char* err, size_t err_size)
+{
+  memset(out_plan, 0, sizeof(*out_plan));
+  uint8_t* unused_data;
+  size_t unused_len;
+  return patch_pipeline(NULL, 0, model_name, opts, NULL, progress, progress_user_data,
+                        &unused_data, &unused_len, err, err_size, read_file, read_user_data, out_plan);
+}
+
+bool nam_patch_pipeline(const uint8_t* stock_img_data, size_t stock_img_len, const char* model_name,
+                         const NamPatchOptions* opts, const char* workdir, NamProgressFn progress,
+                         void* progress_user_data, uint8_t** out_img_data, size_t* out_img_len,
+                         char* err, size_t err_size)
+{
+  return patch_pipeline(stock_img_data, stock_img_len, model_name, opts, workdir, progress,
+                        progress_user_data, out_img_data, out_img_len, err, err_size, NULL, NULL, NULL);
 }

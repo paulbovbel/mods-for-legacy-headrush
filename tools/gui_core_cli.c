@@ -8,6 +8,7 @@
  * usage: gui-core-cli <stock.img> <out.img> --model pedalboard|mx5|gigboard
  *                      [--anxiety-hijack [--instances 2|4]] [--no-nam-pedals] [--reverb-pedal] [--page-pedal [--page-down-note N] [--page-up-note N]]
  *                      [--keep-work-dir]
+ *   or: gui-core-cli <input-directory> <plan-directory> --file-plan --model mx5 [--instances 2|4]
  *
  * Pedalboard default: adds the "NAM" and "NAM TWO" pedals (two instances each). --anxiety-hijack additionally (opt-in) makes Anxiety OD run
  * NAM (--instances 4 also hijacks Anxiety OD V2); --no-nam-pedals leaves out the new pedals (hijack only). MX5 and
@@ -22,6 +23,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#ifdef _WIN32
+#include <direct.h>
+#endif
 
 static void die(const char* fmt, ...)
 {
@@ -61,7 +66,56 @@ static void write_whole_file(const char* path, const uint8_t* data, size_t len)
     die("opening %s for write: %s", path, strerror(errno));
   if (len > 0 && fwrite(data, 1, len, f) != len)
     die("short write on %s", path);
-  fclose(f);
+  if (fclose(f) != 0)
+    die("closing %s: %s", path, strerror(errno));
+}
+
+static bool read_plan_input(const char* path, void* user_data, uint8_t** data, size_t* len,
+                             char* err, size_t err_size)
+{
+  char local[4096];
+  int n = snprintf(local, sizeof(local), "%s%s", (const char*)user_data, path);
+  if (n < 0 || (size_t)n >= sizeof(local))
+  {
+    snprintf(err, err_size, "input path too long");
+    return false;
+  }
+  *data = read_whole_file(local, len);
+  return true;
+}
+
+static void write_plan(const char* directory, const NamFilePlan* plan)
+{
+  /* Refuse existing outputs. plan.json is written last as the completion marker. */
+#ifdef _WIN32
+  int result = _mkdir(directory);
+#else
+  int result = mkdir(directory, 0700);
+#endif
+  if (result != 0)
+    die("creating plan directory %s: %s", directory, strerror(errno));
+  char path[4096];
+  for (size_t i = 0; i < plan->count; ++i)
+  {
+    int n = snprintf(path, sizeof(path), "%s/%zu.bin", directory, i);
+    if (n < 0 || (size_t)n >= sizeof(path))
+      die("output path too long");
+    write_whole_file(path, plan->files[i].data, plan->files[i].len);
+  }
+  int n = snprintf(path, sizeof(path), "%s/plan.json", directory);
+  if (n < 0 || (size_t)n >= sizeof(path))
+    die("output path too long");
+  FILE* manifest = fopen(path, "wb");
+  if (!manifest)
+    die("opening %s: %s", path, strerror(errno));
+  fprintf(manifest, "{\"version\":1,\"files\":[\n");
+  for (size_t i = 0; i < plan->count; ++i)
+    fprintf(manifest, "%s{\"path\":\"%s\",\"file\":\"%zu.bin\",\"mode\":%u}",
+            i ? ",\n" : "", plan->files[i].path, i, plan->files[i].mode);
+  fprintf(manifest, "\n]}\n");
+  bool failed = ferror(manifest) != 0;
+  if (fclose(manifest) != 0 || failed)
+    die("writing %s failed", path);
 }
 
 static void print_progress(const char* message, void* user_data)
@@ -74,7 +128,8 @@ int main(int argc, char** argv)
 {
   const char* usage =
       "usage: %s <stock.img> <out.img> --model pedalboard|mx5|gigboard [--anxiety-hijack [--instances 2|4]] "
-      "[--no-nam-pedals] [--reverb-pedal] [--page-pedal [--page-down-note N] [--page-up-note N]] [--keep-work-dir]";
+      "[--no-nam-pedals] [--reverb-pedal] [--page-pedal [--page-down-note N] [--page-up-note N]] [--keep-work-dir]\n"
+      "       with --file-plan: input is a directory mirroring device paths, output is a new plan directory";
   if (argc < 3)
     die(usage, argv[0]);
 
@@ -82,6 +137,7 @@ int main(int argc, char** argv)
   const char* output_img = argv[2];
   const char* model_name = NULL;
   bool keep_work_dir = false;
+  bool file_plan = false;
   int instances = 2;
   bool page_pedal = false;
   bool anxiety_hijack = false;
@@ -120,6 +176,8 @@ int main(int argc, char** argv)
       page_up_note = atoi(argv[++i]);
     else if (strcmp(argv[i], "--keep-work-dir") == 0)
       keep_work_dir = true;
+    else if (strcmp(argv[i], "--file-plan") == 0)
+      file_plan = true;
     else
       die("unknown argument: %s", argv[i]);
   }
@@ -146,6 +204,21 @@ int main(int argc, char** argv)
   }
   if (instances == 4 && !opts.anxiety_hijack)
     die("--instances 4 needs the Anxiety OD hijack");
+
+  if (file_plan)
+  {
+    if (keep_work_dir)
+      die("--keep-work-dir does not apply to --file-plan");
+    NamFilePlan plan;
+    char err[1024];
+    if (!nam_patch_plan(read_plan_input, (void*)input_img, model_name, &opts,
+                        print_progress, NULL, &plan, err, sizeof(err)))
+      die("%s", err);
+    write_plan(output_img, &plan);
+    printf("OK  wrote %s/plan.json (%zu files; input files unchanged)\n", output_img, plan.count);
+    nam_file_plan_free(&plan);
+    return 0;
+  }
 
   char workdir[NAM_TEMPDIR_MAX_PATH];
   char tempdir_err[256];
